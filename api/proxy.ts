@@ -5,6 +5,166 @@ const TARGET_BASE =
   process.env.TARGET_URL ??
   "https://n8n.athenas.me/webhook/dash-revoltado";
 
+const PAGINATION_KEYS = new Set([
+  "page",
+  "limit",
+  "per_page",
+  "page_size",
+  "pageSize",
+]);
+
+const DEFAULT_PAGE_SIZE = 100;
+const MAX_PAGE_SIZE = 1000;
+const ARRAY_FIELD_PREFERENCES = [
+  "data",
+  "items",
+  "records",
+  "rows",
+  "result",
+  "results",
+  "payload",
+  "entries",
+];
+
+type PaginationConfig = {
+  enabled: boolean;
+  page: number;
+  pageSize: number;
+};
+
+function sanitizePositiveInt(
+  value: string | null,
+  fallback: number,
+  max?: number
+): number {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    const normalized = Math.floor(parsed);
+    if (max) {
+      return Math.min(normalized, max);
+    }
+    return normalized;
+  }
+  return fallback;
+}
+
+function extractPagination(searchParams: URLSearchParams): PaginationConfig {
+  const pageRaw = searchParams.get("page");
+  const sizeRaw =
+    searchParams.get("limit") ??
+    searchParams.get("per_page") ??
+    searchParams.get("page_size") ??
+    searchParams.get("pageSize");
+
+  const enabled = Boolean(pageRaw ?? sizeRaw);
+  const page = sanitizePositiveInt(pageRaw, 1);
+  const pageSize = sanitizePositiveInt(
+    sizeRaw,
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE
+  );
+
+  return { enabled, page, pageSize };
+}
+
+type ArrayTarget = {
+  data: any[];
+  replace: (replacement: any[]) => any;
+  rootIsArray: boolean;
+};
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null;
+}
+
+function makeReplacement(
+  record: Record<string, any>,
+  key: string,
+  nextValue: any
+) {
+  return { ...record, [key]: nextValue };
+}
+
+function targetFromKey(
+  record: Record<string, any>,
+  key: string
+): ArrayTarget | null {
+  if (!(key in record)) return null;
+  const candidate = record[key];
+
+  if (Array.isArray(candidate)) {
+    return {
+      data: candidate,
+      replace: (replacement: any[]) => makeReplacement(record, key, replacement),
+      rootIsArray: false,
+    };
+  }
+
+  if (typeof candidate === "string") {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) {
+        return {
+          data: parsed,
+          replace: (replacement: any[]) =>
+            makeReplacement(record, key, JSON.stringify(replacement)),
+          rootIsArray: false,
+        };
+      }
+    } catch (_) {
+      // Não é um JSON válido; segue a busca.
+    }
+  }
+
+  return null;
+}
+
+function findArrayTarget(value: unknown): ArrayTarget | null {
+  if (Array.isArray(value)) {
+    return {
+      data: value,
+      replace: (replacement: any[]) => replacement,
+      rootIsArray: true,
+    };
+  }
+
+  if (!isPlainObject(value)) {
+    return null;
+  }
+
+  const record = value;
+
+  for (const key of ARRAY_FIELD_PREFERENCES) {
+    const target = targetFromKey(record, key);
+    if (target) {
+      return target;
+    }
+  }
+
+  for (const key of Object.keys(record)) {
+    const target = targetFromKey(record, key);
+    if (target) {
+      return target;
+    }
+  }
+
+  for (const [key, child] of Object.entries(record)) {
+    if (isPlainObject(child) || Array.isArray(child)) {
+      const nested = findArrayTarget(child);
+      if (nested) {
+        return {
+          data: nested.data,
+          replace: (replacement: any[]) =>
+            makeReplacement(record, key, nested.replace(replacement)),
+          rootIsArray: false,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
 function cors(origin = "*") {
   return {
     "Access-Control-Allow-Origin": origin,
@@ -26,8 +186,12 @@ export default async function handler(req: Request): Promise<Response> {
   const incomingUrl = new URL(req.url);
   const targetUrl = new URL(TARGET_BASE);
 
+  const pagination = extractPagination(incomingUrl.searchParams);
+
   incomingUrl.searchParams.forEach((v, k) => {
-    targetUrl.searchParams.append(k, v);
+    if (!PAGINATION_KEYS.has(k)) {
+      targetUrl.searchParams.append(k, v);
+    }
   });
 
   // Garante type=json, se não vier na URL
@@ -90,6 +254,54 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     // 🔹 4 — Fluxo normal: devolve exatamente o que o upstream mandou
+    if (pagination.enabled && upstream.ok && req.method === "GET") {
+      try {
+        const parsed = JSON.parse(upstreamText);
+        const target = findArrayTarget(parsed);
+
+        if (target) {
+          const totalItems = target.data.length;
+          const totalPages =
+            pagination.pageSize > 0
+              ? Math.ceil(totalItems / pagination.pageSize)
+              : 0;
+          const start = (pagination.page - 1) * pagination.pageSize;
+          const end = start + pagination.pageSize;
+          const sliced = target.data.slice(start, end);
+
+          const paginationMeta = {
+            page: pagination.page,
+            pageSize: pagination.pageSize,
+            totalItems,
+            totalPages,
+          };
+
+          let payload = target.replace(sliced);
+
+          if (target.rootIsArray) {
+            payload = { data: payload, pagination: paginationMeta };
+          } else if (payload && typeof payload === "object") {
+            payload = { ...(payload as Record<string, any>), pagination: paginationMeta };
+          } else {
+            payload = { data: sliced, pagination: paginationMeta };
+          }
+
+          outHeaders.set(
+            "content-type",
+            "application/json; charset=utf-8"
+          );
+
+          return new Response(JSON.stringify(payload), {
+            status: upstream.status,
+            statusText: upstream.statusText,
+            headers: outHeaders,
+          });
+        }
+      } catch (_) {
+        // Se não conseguir paginar (JSON inválido), segue fluxo normal.
+      }
+    }
+
     return new Response(upstreamText, {
       status: upstream.status,
       statusText: upstream.statusText,
