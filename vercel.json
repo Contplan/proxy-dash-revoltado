@@ -1,0 +1,6 @@
+
+{
+  "routes": [
+    { "src": "/dash", "dest": "/api/proxy" }
+  ]
+}
