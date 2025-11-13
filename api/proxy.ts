@@ -15,6 +15,16 @@ const PAGINATION_KEYS = new Set([
 
 const DEFAULT_PAGE_SIZE = 100;
 const MAX_PAGE_SIZE = 1000;
+const ARRAY_FIELD_PREFERENCES = [
+  "data",
+  "items",
+  "records",
+  "rows",
+  "result",
+  "results",
+  "payload",
+  "entries",
+];
 
 type PaginationConfig = {
   enabled: boolean;
@@ -55,6 +65,104 @@ function extractPagination(searchParams: URLSearchParams): PaginationConfig {
   );
 
   return { enabled, page, pageSize };
+}
+
+type ArrayTarget = {
+  data: any[];
+  replace: (replacement: any[]) => any;
+  rootIsArray: boolean;
+};
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null;
+}
+
+function makeReplacement(
+  record: Record<string, any>,
+  key: string,
+  nextValue: any
+) {
+  return { ...record, [key]: nextValue };
+}
+
+function targetFromKey(
+  record: Record<string, any>,
+  key: string
+): ArrayTarget | null {
+  if (!(key in record)) return null;
+  const candidate = record[key];
+
+  if (Array.isArray(candidate)) {
+    return {
+      data: candidate,
+      replace: (replacement: any[]) => makeReplacement(record, key, replacement),
+      rootIsArray: false,
+    };
+  }
+
+  if (typeof candidate === "string") {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) {
+        return {
+          data: parsed,
+          replace: (replacement: any[]) =>
+            makeReplacement(record, key, JSON.stringify(replacement)),
+          rootIsArray: false,
+        };
+      }
+    } catch (_) {
+      // Não é um JSON válido; segue a busca.
+    }
+  }
+
+  return null;
+}
+
+function findArrayTarget(value: unknown): ArrayTarget | null {
+  if (Array.isArray(value)) {
+    return {
+      data: value,
+      replace: (replacement: any[]) => replacement,
+      rootIsArray: true,
+    };
+  }
+
+  if (!isPlainObject(value)) {
+    return null;
+  }
+
+  const record = value;
+
+  for (const key of ARRAY_FIELD_PREFERENCES) {
+    const target = targetFromKey(record, key);
+    if (target) {
+      return target;
+    }
+  }
+
+  for (const key of Object.keys(record)) {
+    const target = targetFromKey(record, key);
+    if (target) {
+      return target;
+    }
+  }
+
+  for (const [key, child] of Object.entries(record)) {
+    if (isPlainObject(child) || Array.isArray(child)) {
+      const nested = findArrayTarget(child);
+      if (nested) {
+        return {
+          data: nested.data,
+          replace: (replacement: any[]) =>
+            makeReplacement(record, key, nested.replace(replacement)),
+          rootIsArray: false,
+        };
+      }
+    }
+  }
+
+  return null;
 }
 
 function cors(origin = "*") {
@@ -149,28 +257,17 @@ export default async function handler(req: Request): Promise<Response> {
     if (pagination.enabled && upstream.ok && req.method === "GET") {
       try {
         const parsed = JSON.parse(upstreamText);
-        let dataArray: any[] | null = null;
-        const isArray = Array.isArray(parsed);
+        const target = findArrayTarget(parsed);
 
-        if (isArray) {
-          dataArray = parsed;
-        } else if (
-          parsed &&
-          typeof parsed === "object" &&
-          Array.isArray((parsed as Record<string, any>).data)
-        ) {
-          dataArray = (parsed as Record<string, any>).data;
-        }
-
-        if (dataArray) {
-          const totalItems = dataArray.length;
+        if (target) {
+          const totalItems = target.data.length;
           const totalPages =
             pagination.pageSize > 0
               ? Math.ceil(totalItems / pagination.pageSize)
               : 0;
           const start = (pagination.page - 1) * pagination.pageSize;
           const end = start + pagination.pageSize;
-          const sliced = dataArray.slice(start, end);
+          const sliced = target.data.slice(start, end);
 
           const paginationMeta = {
             page: pagination.page,
@@ -179,13 +276,15 @@ export default async function handler(req: Request): Promise<Response> {
             totalPages,
           };
 
-          const payload = isArray
-            ? { data: sliced, pagination: paginationMeta }
-            : {
-                ...(parsed as Record<string, any>),
-                data: sliced,
-                pagination: paginationMeta,
-              };
+          let payload = target.replace(sliced);
+
+          if (target.rootIsArray) {
+            payload = { data: payload, pagination: paginationMeta };
+          } else if (payload && typeof payload === "object") {
+            payload = { ...(payload as Record<string, any>), pagination: paginationMeta };
+          } else {
+            payload = { data: sliced, pagination: paginationMeta };
+          }
 
           outHeaders.set(
             "content-type",
