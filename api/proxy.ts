@@ -5,6 +5,58 @@ const TARGET_BASE =
   process.env.TARGET_URL ??
   "https://n8n.athenas.me/webhook/dash-revoltado";
 
+const PAGINATION_KEYS = new Set([
+  "page",
+  "limit",
+  "per_page",
+  "page_size",
+  "pageSize",
+]);
+
+const DEFAULT_PAGE_SIZE = 100;
+const MAX_PAGE_SIZE = 1000;
+
+type PaginationConfig = {
+  enabled: boolean;
+  page: number;
+  pageSize: number;
+};
+
+function sanitizePositiveInt(
+  value: string | null,
+  fallback: number,
+  max?: number
+): number {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    const normalized = Math.floor(parsed);
+    if (max) {
+      return Math.min(normalized, max);
+    }
+    return normalized;
+  }
+  return fallback;
+}
+
+function extractPagination(searchParams: URLSearchParams): PaginationConfig {
+  const pageRaw = searchParams.get("page");
+  const sizeRaw =
+    searchParams.get("limit") ??
+    searchParams.get("per_page") ??
+    searchParams.get("page_size") ??
+    searchParams.get("pageSize");
+
+  const enabled = Boolean(pageRaw ?? sizeRaw);
+  const page = sanitizePositiveInt(pageRaw, 1);
+  const pageSize = sanitizePositiveInt(
+    sizeRaw,
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE
+  );
+
+  return { enabled, page, pageSize };
+}
+
 function cors(origin = "*") {
   return {
     "Access-Control-Allow-Origin": origin,
@@ -26,8 +78,12 @@ export default async function handler(req: Request): Promise<Response> {
   const incomingUrl = new URL(req.url);
   const targetUrl = new URL(TARGET_BASE);
 
+  const pagination = extractPagination(incomingUrl.searchParams);
+
   incomingUrl.searchParams.forEach((v, k) => {
-    targetUrl.searchParams.append(k, v);
+    if (!PAGINATION_KEYS.has(k)) {
+      targetUrl.searchParams.append(k, v);
+    }
   });
 
   // Garante type=json, se não vier na URL
@@ -90,6 +146,63 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     // 🔹 4 — Fluxo normal: devolve exatamente o que o upstream mandou
+    if (pagination.enabled && upstream.ok && req.method === "GET") {
+      try {
+        const parsed = JSON.parse(upstreamText);
+        let dataArray: any[] | null = null;
+        const isArray = Array.isArray(parsed);
+
+        if (isArray) {
+          dataArray = parsed;
+        } else if (
+          parsed &&
+          typeof parsed === "object" &&
+          Array.isArray((parsed as Record<string, any>).data)
+        ) {
+          dataArray = (parsed as Record<string, any>).data;
+        }
+
+        if (dataArray) {
+          const totalItems = dataArray.length;
+          const totalPages =
+            pagination.pageSize > 0
+              ? Math.ceil(totalItems / pagination.pageSize)
+              : 0;
+          const start = (pagination.page - 1) * pagination.pageSize;
+          const end = start + pagination.pageSize;
+          const sliced = dataArray.slice(start, end);
+
+          const paginationMeta = {
+            page: pagination.page,
+            pageSize: pagination.pageSize,
+            totalItems,
+            totalPages,
+          };
+
+          const payload = isArray
+            ? { data: sliced, pagination: paginationMeta }
+            : {
+                ...(parsed as Record<string, any>),
+                data: sliced,
+                pagination: paginationMeta,
+              };
+
+          outHeaders.set(
+            "content-type",
+            "application/json; charset=utf-8"
+          );
+
+          return new Response(JSON.stringify(payload), {
+            status: upstream.status,
+            statusText: upstream.statusText,
+            headers: outHeaders,
+          });
+        }
+      } catch (_) {
+        // Se não conseguir paginar (JSON inválido), segue fluxo normal.
+      }
+    }
+
     return new Response(upstreamText, {
       status: upstream.status,
       statusText: upstream.statusText,
